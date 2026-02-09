@@ -27,7 +27,6 @@ try:
         firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
         print(">>> Firebase hitelesítés SIKERES!")
         
-        # Szerver állapot frissítése UTC idővel
         db.reference('server_status').update({
             'last_boot_utc': time.time(),
             'online': True
@@ -68,7 +67,7 @@ def perform_scan(force_reset=False):
                 t = item.title.text.strip()
                 l = item.link.text.strip()
                 if any(k in t.lower() for k in keywords):
-                    # Link alapú ellenőrzés (időzónától független!)
+                    # Itt van szükség az .indexOn: "link" szabályra!
                     snapshot = ref.order_by_child('link').equal_to(l).get()
                     if not snapshot:
                         ref.push({
@@ -78,7 +77,7 @@ def perform_scan(force_reset=False):
                             'timestamp': time.time()
                         })
         except Exception as e:
-            print(f"Szkennelési hiba: {e}")
+            print(f"Szkennelési hiba (lehet index hiány): {e}")
 
 # --- BOT CIKLUS ---
 def bot_loop():
@@ -88,16 +87,15 @@ def bot_loop():
     
     while True:
         try:
-            # 1. RESET PARANCS (Logikai figyelés, nem időfüggő)
+            # 1. RESET PARANCS
             cmd_ref = db.reference('commands/full_scan').get()
-            
-            # Kifejezetten a False értéket keressük
             if isinstance(cmd_ref, dict) and cmd_ref.get('processed') is False:
-                print(f">>> RESET parancs észlelve! (Érték: {cmd_ref.get('processed')})")
+                print(">>> RESET parancs észlelve!")
                 perform_scan(force_reset=True)
                 db.reference('commands/full_scan').update({'processed': True})
 
-            # 2. ÉLESÍTÉS (Státusz figyelés, nem időfüggő)
+            # 2. ÉLESÍTÉS (Státusz figyelés)
+            # Itt van szükség az .indexOn: "status" szabályra!
             deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
             if deals:
                 for d_id, d_data in deals.items():
@@ -111,9 +109,10 @@ def bot_loop():
                 last_rss_check = time.time()
 
         except Exception as e:
-            print(f"Hiba a bot hurokban: {e}")
+            print(f"Hiba a bot hurokban (Index hiba esetén állítsd be a Firebase Rules-t!): {e}")
+            time.sleep(30) # Hiba esetén lassítunk, hogy ne teljen meg a log
         
-        time.sleep(10)
+        time.sleep(15)
 
 # Háttérszál indítása
 threading.Thread(target=bot_loop, daemon=True).start()
