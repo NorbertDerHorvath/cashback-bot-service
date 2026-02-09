@@ -26,11 +26,6 @@ try:
         cred = credentials.Certificate(JSON_FILE)
         firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
         print(">>> Firebase hitelesítés SIKERES!")
-        
-        db.reference('server_status').update({
-            'last_boot_utc': time.time(),
-            'online': True
-        })
 except Exception as e:
     print(f">>> Firebase hiba: {e}")
 
@@ -50,7 +45,7 @@ def send_telegram(message):
 
 def perform_scan(force_reset=False):
     if force_reset:
-        print("!!! RESET INDÍTVA !!!")
+        print("!!! ADATBÁZIS TÖRLÉSE !!!")
         db.reference('deals').delete()
         send_telegram("🗑️ *Adatbázis ürítve, új keresés indul!*")
 
@@ -67,54 +62,58 @@ def perform_scan(force_reset=False):
                 t = item.title.text.strip()
                 l = item.link.text.strip()
                 if any(k in t.lower() for k in keywords):
-                    # Itt van szükség az .indexOn: "link" szabályra!
-                    snapshot = ref.order_by_child('link').equal_to(l).get()
-                    if not snapshot:
-                        ref.push({
-                            'title': t, 
-                            'link': l, 
-                            'status': 'pending', 
-                            'timestamp': time.time()
-                        })
+                    # Ha nincs IndexOn, itt elszáll a kód!
+                    try:
+                        snapshot = ref.order_by_child('link').equal_to(l).get()
+                        if not snapshot:
+                            ref.push({
+                                'title': t, 
+                                'link': l, 
+                                'status': 'pending', 
+                                'timestamp': time.time()
+                            })
+                    except Exception as e:
+                        print(f"Hiba a link ellenőrzésekor (Index hiba?): {e}")
         except Exception as e:
-            print(f"Szkennelési hiba (lehet index hiány): {e}")
+            print(f"Szkennelési hiba ({url}): {e}")
 
 # --- BOT CIKLUS ---
 def bot_loop():
-    time.sleep(5)
-    print("--- Háttérfolyamat elindult ---")
+    print("--- Bot Loop elindítva ---")
     last_rss_check = 0
     
     while True:
         try:
-            # 1. RESET PARANCS
-            cmd_ref = db.reference('commands/full_scan').get()
-            if isinstance(cmd_ref, dict) and cmd_ref.get('processed') is False:
-                print(">>> RESET parancs észlelve!")
+            # 1. COMMANDS FIGYELÉSE (Reset)
+            cmd = db.reference('commands/full_scan').get()
+            if isinstance(cmd, dict) and cmd.get('processed') is False:
                 perform_scan(force_reset=True)
                 db.reference('commands/full_scan').update({'processed': True})
+                print(">>> Reset sikeres.")
 
-            # 2. ÉLESÍTÉS (Státusz figyelés)
-            # Itt van szükség az .indexOn: "status" szabályra!
-            deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
-            if deals:
-                for d_id, d_data in deals.items():
-                    msg = f"🚀 *AKCIÓ ÉLESÍTVE!*\n\n📌 {d_data['title']}\n\n🔗 {d_data['link']}"
-                    if send_telegram(msg):
-                        db.reference(f'deals/{d_id}').update({'status': 'completed'})
+            # 2. ÉLESÍTÉS FIGYELÉSE
+            # Ha nincs IndexOn status-ra, itt is elszáll!
+            try:
+                deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
+                if deals:
+                    for d_id, d_data in deals.items():
+                        msg = f"🚀 *AKCIÓ ÉLESÍTVE!*\n\n📌 {d_data['title']}\n\n🔗 {d_data['link']}"
+                        if send_telegram(msg):
+                            db.reference(f'deals/{d_id}').update({'status': 'completed'})
+            except Exception as e:
+                print(f"Hiba az élesítésnél (Index hiba?): {e}")
 
-            # 3. ÜTEMEZETT RSS SZKENNELÉS
+            # 3. RSS SZKENNELÉS
             if time.time() - last_rss_check > 1800:
                 perform_scan()
                 last_rss_check = time.time()
 
         except Exception as e:
-            print(f"Hiba a bot hurokban (Index hiba esetén állítsd be a Firebase Rules-t!): {e}")
-            time.sleep(30) # Hiba esetén lassítunk, hogy ne teljen meg a log
+            print(f"Általános hurok hiba: {e}")
         
         time.sleep(15)
 
-# Háttérszál indítása
+# Indítás
 threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
