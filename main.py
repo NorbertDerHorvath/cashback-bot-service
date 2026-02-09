@@ -35,9 +35,8 @@ def send_telegram(message):
 
 def perform_scan(force_reset=False):
     if force_reset:
-        print("!!! RESET INDÍTVA - Adatok törlése !!!")
         db.reference('deals').delete()
-        send_telegram("🗑️ Adatbázis ürítve!")
+        send_telegram("🗑️ *Adatbázis ürítve, új keresés indul!*")
 
     ref = db.reference('deals')
     feeds = ["https://rss.app/feeds/UBlHGZPrkiBFdRod.xml", "https://rss.app/feeds/WsCQbaznNvga5E3d.xml"]
@@ -50,9 +49,19 @@ def perform_scan(force_reset=False):
             for item in items:
                 t, l = item.title.text.strip(), item.link.text.strip()
                 if any(k in t.lower() for k in keywords):
-                    # Ha itt elszáll, akkor a Rules "link" indexe hiányzik!
-                    if not ref.order_by_child('link').equal_to(l).get():
-                        ref.push({'title': t, 'link': l, 'status': 'pending', 'timestamp': time.time()})
+                    # Megnézzük, létezik-e már
+                    exists = ref.order_by_child('link').equal_to(l).get()
+                    if not exists:
+                        # AZONNALI KÜLDÉS TELEGRAMRA
+                        send_telegram(f"🔔 *ÚJ AJÁNLAT TALÁLVA!*\n\n📌 {t}\n\n🔗 {l}")
+                        
+                        # Mentés az adatbázisba 'pending' státusszal
+                        ref.push({
+                            'title': t, 
+                            'link': l, 
+                            'status': 'pending', 
+                            'timestamp': time.time()
+                        })
         except Exception as e:
             print(f"Szkennelési hiba: {e}")
 
@@ -61,27 +70,20 @@ def bot_loop():
     last_rss_check = 0
     while True:
         try:
-            # RESET ELLENŐRZÉS
-            cmd_ref = db.reference('commands/full_scan').get()
-            # LOGOLJUK MIT LÁTUNK
-            if cmd_ref:
-                print(f"DEBUG: cmd/full_scan/processed értéke: {cmd_ref.get('processed')}")
-            
-            if isinstance(cmd_ref, dict) and cmd_ref.get('processed') is False:
+            # 1. RESET FIGYELÉS
+            cmd = db.reference('commands/full_scan').get()
+            if isinstance(cmd, dict) and cmd.get('processed') is False:
                 perform_scan(force_reset=True)
                 db.reference('commands/full_scan').update({'processed': True})
 
-            # ÉLESÍTÉS ELLENŐRZÉS
-            # Ha itt elszáll, akkor a Rules "status" indexe hiányzik!
+            # 2. ÉLESÍTÉS FIGYELÉS (Ha kézzel nyomsz rá az adminban)
             deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
             if deals:
-                print(f"DEBUG: {len(deals)} db küldendő tétel.")
                 for d_id, d_data in deals.items():
-                    msg = f"🚀 *AKCIÓ ÉLESÍTVE!*\n\n{d_data['title']}\n\n{d_data['link']}"
-                    send_telegram(msg)
+                    send_telegram(f"🚀 *ADMIN ÉLESÍTETTE!*\n\n{d_data['title']}\n\n{d_data['link']}")
                     db.reference(f'deals/{d_id}').update({'status': 'completed'})
 
-            # RSS IDŐZÍTÉS (30 perc)
+            # 3. RSS ÜTEMEZÉS
             if time.time() - last_rss_check > 1800:
                 perform_scan()
                 last_rss_check = time.time()
