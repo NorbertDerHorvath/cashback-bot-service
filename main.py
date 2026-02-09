@@ -7,7 +7,7 @@ import threading
 import os
 from flask import Flask
 
-# --- FLASK SZERVER (A Render ébren tartásához) ---
+# --- FLASK SZERVER ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -20,38 +20,43 @@ DB_URL = "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
 TELEGRAM_TOKEN = "8210425098:AAEAkmwRXrIrk9vt2rytnvWhcqSVfxQYa6g"
 CHAT_ID = "8494341633" 
 
-# Firebase Inicializálása
+# Firebase Inicializálása és Kapcsolat ellenőrzése
 if not firebase_admin._apps:
     try:
         cred = credentials.Certificate(JSON_FILE)
         firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
-        print(">>> Firebase sikeresen csatlakozva!")
+        print(">>> Firebase hitelesítés sikeres!")
+        
+        # KÉNYSZERÍTETT ÍRÁSI TESZT: Megnézzük, tényleg látja-e az adatbázist
+        db.reference('server_status').update({
+            'last_boot': time.ctime(),
+            'online': True
+        })
+        print(">>> Firebase írási teszt sikeres! Nézd meg a konzolban a 'server_status' ágat.")
+        
     except Exception as e:
-        print(f">>> Firebase hiba az indulásnál: {e}")
+        print(f">>> KRITIKUS HIBA a Firebase csatlakozásnál: {e}")
 
 # --- FUNKCIÓK ---
 
 def send_telegram(message):
-    print(f">>> Telegram küldés megkísérlése...")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try: 
         r = requests.post(url, json={
             "chat_id": CHAT_ID, 
             "text": message, 
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False
+            "parse_mode": "Markdown"
         }, timeout=15)
-        print(f">>> Telegram válasz státusz: {r.status_code}")
         return r.status_code == 200
     except Exception as e: 
-        print(f">>> Telegram küldési hiba: {e}")
+        print(f">>> Telegram hiba: {e}")
         return False
 
 def perform_scan(force_reset=False):
     if force_reset:
-        print("!!! RESET MŰVELET: Adatbázis ürítése folyamatban... !!!")
+        print("!!! RESET: Adatbázis ürítése !!!")
         db.reference('deals').delete()
-        send_telegram("🗑️ *Az adatbázis törölve. Új szkennelés indult!*")
+        send_telegram("🗑️ *Adatbázis ürítve, új keresés indul!*")
 
     ref = db.reference('deals')
     feeds = ["https://rss.app/feeds/UBlHGZPrkiBFdRod.xml", "https://rss.app/feeds/WsCQbaznNvga5E3d.xml"]
@@ -62,72 +67,54 @@ def perform_scan(force_reset=False):
             r = requests.get(url, timeout=20)
             soup = BeautifulSoup(r.content, "xml")
             items = soup.find_all('item')
-            print(f">>> RSS Scan ({url}): {len(items)} elem letöltve.")
-            
             for item in items:
                 t = item.title.text.strip()
                 l = item.link.text.strip()
-                
                 if any(k in t.lower() for k in keywords):
                     snapshot = ref.order_by_child('link').equal_to(l).get()
                     if not snapshot:
-                        print(f">>> ÚJ TALÁLAT: {t}")
-                        ref.push({
-                            'title': t, 
-                            'link': l, 
-                            'status': 'pending', 
-                            'timestamp': time.time()
-                        })
+                        ref.push({'title': t, 'link': l, 'status': 'pending', 'timestamp': time.time()})
         except Exception as e: 
-            print(f">>> Szkennelési hiba ({url}): {e}")
+            print(f">>> RSS hiba: {e}")
 
-# --- FŐ BOT HUROK (Polling) ---
+# --- FŐ BOT HUROK ---
 def bot_loop():
-    print("--- Háttérfolyamat elindítva (Polling mód) ---")
+    print("--- Polling folyamat elindítva ---")
     last_rss_check = 0
     
     while True:
         try:
-            # 1. DEBUG: Kiírjuk a logba, mit látunk épp a Firebase-ben
+            # 1. RESET ELLENŐRZÉSE
+            # Fontos: a reference-nél nincs per jel az elején!
             cmd_ref = db.reference('commands/full_scan').get()
-            print(f"DEBUG: Firebase parancs állapota jelenleg: {cmd_ref}")
-
-            # 2. RESET ELLENŐRZÉSE
+            
             if cmd_ref and isinstance(cmd_ref, dict):
-                if cmd_ref.get('processed') == False:
-                    print(">>> Reset parancsot észleltem (processed=False)!")
+                is_processed = cmd_ref.get('processed')
+                print(f"--- Ellenőrzés: processed={is_processed} ---") # Ez fog látszódni a logban
+                
+                if is_processed == False:
                     perform_scan(force_reset=True)
                     db.reference('commands/full_scan').update({'processed': True})
-                    print(">>> Reset parancs feldolgozva, processed=True-ra állítva.")
 
-            # 3. ÉLESÍTÉS ELLENŐRZÉSE
+            # 2. ÉLESÍTÉS ELLENŐRZÉSE
             deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
             if deals:
-                print(f">>> {len(deals)} db 'sent' státuszú elemet találtam. Küldés...")
-                for deal_id, deal_data in deals.items():
-                    msg = f"🚀 *AKCIÓ ÉLESÍTVE!*\n\n📌 {deal_data['title']}\n\n🔗 [Kattints ide]({deal_data['link']})"
+                for d_id, d_data in deals.items():
+                    msg = f"🚀 *AKCIÓ ÉLESÍTVE!*\n\n📌 {d_data['title']}\n\n🔗 {d_data['link']}"
                     if send_telegram(msg):
-                        db.reference(f'deals/{deal_id}').update({'status': 'completed'})
-                        print(f">>> {deal_data['title']} sikeresen elküldve és archiválva.")
+                        db.reference(ff'deals/{d_id}').update({'status': 'completed'})
 
-            # 4. RSS SZKENNELÉS (30 percenként)
-            current_time = time.time()
-            if current_time - last_rss_check > 1800:
-                print(">>> Ütemezett RSS szkennelés indul...")
+            # 3. ÜTEMEZETT SCAN
+            if time.time() - last_rss_check > 1800:
                 perform_scan()
-                last_rss_check = current_time
+                last_rss_check = time.time()
 
         except Exception as e:
-            print(f">>> Hiba a polling hurokban: {e}")
+            print(f">>> Hiba a hurokban: {e}")
         
-        time.sleep(5) 
+        time.sleep(10) # 10 másodpercre emeltem, hogy ne blokkoljon a Firebase
 
-# --- INDÍTÁS ---
 if __name__ == "__main__":
-    # Bot indítása külön szálon
     threading.Thread(target=bot_loop, daemon=True).start()
-    
-    # Flask indítása
     port = int(os.environ.get("PORT", 10000))
-    print(f">>> Flask szerver indul a {port} porton...")
     app.run(host='0.0.0.0', port=port)
