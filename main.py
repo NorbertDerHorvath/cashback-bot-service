@@ -1,112 +1,218 @@
-import firebase_admin
-from firebase_admin import credentials, db
-import requests
-from bs4 import BeautifulSoup
-import time
-import threading
-import os
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Bot Online", 200
-
-# --- KONFIG ---
-JSON_FILE = "coupons-79d9f-firebase-adminsdk-fbsvc-6cfc7ef3a2.json" 
-DB_URL = "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
-TELEGRAM_TOKEN = "8210425098:AAEAkmwRXrIrk9vt2rytnvWhcqSVfxQYa6g"
-CHAT_ID = "8494341633" 
-
-try:
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(JSON_FILE)
-        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
-        print(">>> Firebase SIKERES csatlakozás.")
-except Exception as e:
-    print(f">>> Firebase hiba: {e}")
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: 
-        requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
-    except Exception as e:
-        print(f"Telegram hiba: {e}")
-
-def perform_scan(force_reset=False):
-    if force_reset:
-        print("!!! RESET FOLYAMATBAN !!!")
-        db.reference('deals').delete()
-        send_telegram("🗑️ *Adatbázis ürítve, új keresés indul!*")
-
-    ref = db.reference('deals')
-    feeds = ["https://rss.app/feeds/UBlHGZPrkiBFdRod.xml", "https://rss.app/feeds/WsCQbaznNvga5E3d.xml"]
-    keywords = ["geld", "cashback", "gratis", "100%", "probieren", "test"]
-    
-    for url in feeds:
-        try:
-            r = requests.get(url, timeout=20)
-            items = BeautifulSoup(r.content, "xml").find_all('item')
-            for item in items:
-                t = item.title.text.strip()
-                l = item.link.text.strip()
-                if any(k in t.lower() for k in keywords):
-                    # Ellenőrzés: Létezik-e már a link?
-                    exists = ref.order_by_child('link').equal_to(l).get()
-                    if not exists:
-                        print(f"Új ajánlat: {t}")
-                        send_telegram(f"🔔 *ÚJ AJÁNLAT!*\n\n📌 {t}\n\n🔗 {l}")
-                        ref.push({
-                            'title': t, 
-                            'link': l, 
-                            'status': 'pending', 
-                            'timestamp': time.time()
-                        })
-        except Exception as e:
-            print(f"Szkennelési hiba ({url}): {e}")
-
-def bot_loop():
-    print(">>> Bot hurok elindítva...")
-    last_rss_check = 0
-    
-    while True:
-        try:
-            # 1. RESET PARANCS FIGYELÉSE (Javított, robusztusabb verzió)
-            cmd_ref = db.reference('commands/full_scan')
-            cmd = cmd_ref.get()
-            
-            if cmd is not None:
-                # Kezeljük ha dict, és ha sima boolean is
-                is_processed = cmd.get('processed') if isinstance(cmd, dict) else True
-                
-                if is_processed is False:
-                    print(">>> Reset parancs észlelve!")
-                    perform_scan(force_reset=True)
-                    cmd_ref.update({'processed': True, 'last_action': time.time()})
-
-            # 2. ADMIN ÉLESÍTÉS FIGYELÉSE
-            deals = db.reference('deals').order_by_child('status').equal_to('sent').get()
-            if deals:
-                for d_id, d_data in deals.items():
-                    send_telegram(f"🚀 *ADMIN ÉLESÍTETTE!*\n\n{d_data['title']}\n\n{d_data['link']}")
-                    db.reference(f'deals/{d_id}').update({'status': 'completed'})
-
-            # 3. RSS SZKENNELÉS (30 percenként)
-            now = time.time()
-            if now - last_rss_check > 1800:
-                perform_scan()
-                last_rss_check = now
-
-        except Exception as e:
-            print(f"Hiba a hurokban: {e}")
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cashback Admin & Public Panel</title>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+    <style>
+        :root { 
+            --admin-color: #2c3e50; 
+            --accent-color: #e74c3c; 
+            --success-color: #27ae60;
+            --bg-color: #f4f7f6;
+        }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg-color); margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1000px; margin: auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
         
-        time.sleep(10) # 10 másodpercenként néz rá a parancsokra
+        header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 20px; }
+        #status-indicator { font-size: 14px; font-weight: bold; }
 
-# Flask futtatása külön szálon nem kell, az app.run blokkoló, 
-# ezért a botot indítjuk threading-el.
-threading.Thread(target=bot_loop, daemon=True).start()
+        /* Login Szekció */
+        #login-section { background: #f9f9f9; padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 25px; border: 1px solid #ddd; }
+        input { padding: 12px; margin: 5px; border: 1px solid #ccc; border-radius: 5px; width: 200px; }
+        .btn-login { background: var(--admin-color); color: white; border: none; padding: 12px 25px; cursor: pointer; border-radius: 5px; font-weight: bold; }
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        /* Admin Vezérlőpult */
+        #admin-controls { display: none; background: #fff5f5; padding: 20px; border-radius: 10px; margin-bottom: 25px; border: 1px solid #feb2b2; }
+        .btn-reset { background: var(--accent-color); color: white; border: none; padding: 15px; width: 100%; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; text-transform: uppercase; margin-bottom: 10px; }
+
+        /* Táblázat */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { background: #f8fafc; color: #64748b; padding: 15px; text-align: left; font-size: 13px; text-transform: uppercase; border-bottom: 2px solid #edf2f7; }
+        td { padding: 15px; border-bottom: 1px solid #edf2f7; vertical-align: middle; }
+        tr:hover { background: #f1f5f9; }
+        
+        a { color: #3182ce; text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; }
+
+        /* Gombok és Badge-ek */
+        .btn { padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: bold; transition: 0.2s; }
+        .btn-approve { background: var(--success-color); color: white; margin-right: 5px; }
+        .btn-delete { background: #94a3b8; color: white; }
+        .btn:hover { opacity: 0.8; transform: translateY(-1px); }
+
+        .badge { padding: 5px 10px; border-radius: 20px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
+        .status-pending { background: #fef3c7; color: #92400e; }
+        .status-sent { background: #dcfce7; color: #166534; }
+        .status-completed { background: #dbeafe; color: #1e40af; }
+
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1 id="panel-title" style="margin:0; font-size: 24px;">Cashback Ajánlatok</h1>
+        <div id="status-indicator">Kapcsolódás...</div>
+    </header>
+
+    <div id="login-section">
+        <p style="margin-top:0;">Admin hozzáférés szükséges a kezeléshez:</p>
+        <input type="text" id="username" placeholder="Felhasználónév">
+        <input type="password" id="password" placeholder="Jelszó">
+        <button class="btn-login" onclick="handleLogin()">Belépés</button>
+    </div>
+
+    <div id="admin-controls">
+        <button class="btn-reset" onclick="triggerReset()">🔄 ADATBÁZIS TELJES ÜRÍTÉSE & ÚJ KERESÉS</button>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: #c53030; font-size: 13px;"><b>Bejelentkezve:</b> Norbi</span>
+            <button class="btn" style="background:#eee; color:#333;" onclick="location.reload()">Kijelentkezés</button>
+        </div>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Idő</th>
+                <th>Termék / Ajánlat</th>
+                <th>Állapot</th>
+                <th class="admin-only hidden">Műveletek</th>
+            </tr>
+        </thead>
+        <tbody id="dealsTableBody">
+            <tr><td colspan="4" style="text-align:center; padding: 40px; color: #999;">Betöltés folyamatban...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<script>
+    // 1. Firebase Konfiguráció
+    const firebaseConfig = {
+        databaseURL: "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const database = firebase.database();
+
+    let isAdmin = false;
+
+    // 2. Kapcsolat ellenőrzése
+    database.ref('.info/connected').on('value', (snapshot) => {
+        const indicator = document.getElementById('status-indicator');
+        if (snapshot.val() === true) {
+            indicator.innerHTML = "<span style='color: #27ae60;'>🟢 ONLINE</span>";
+        } else {
+            indicator.innerHTML = "<span style='color: #e74c3c;'>🔴 OFFLINE</span>";
+        }
+    });
+
+    // 3. Bejelentkezés kezelése
+    function handleLogin() {
+        const u = document.getElementById('username').value;
+        const p = document.getElementById('password').value;
+
+        if (u === "norbi" && p === "norbi") {
+            isAdmin = true;
+            document.getElementById('login-section').classList.add('hidden');
+            document.getElementById('admin-controls').style.display = 'block';
+            document.getElementById('panel-title').innerText = "Cashback ADMIN";
+            
+            // Admin oszlop megjelenítése a táblázat fejlécében
+            document.querySelectorAll('.admin-only').forEach(el => el.classList.remove('hidden'));
+            
+            fetchDeals(); // Adatok újratöltése admin módban
+            console.log("Admin bejelentkezve: Norbi");
+        } else {
+            alert("Hibás felhasználónév vagy jelszó!");
+        }
+    }
+
+    // 4. Adatok lekérése és megjelenítése
+    function fetchDeals() {
+        const dealsRef = database.ref('deals');
+        dealsRef.on('value', (snapshot) => {
+            const data = snapshot.val();
+            const tbody = document.getElementById('dealsTableBody');
+            tbody.innerHTML = '';
+
+            if (!data) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 20px;">Jelenleg nincs aktív ajánlat.</td></tr>';
+                return;
+            }
+
+            // Kulcsok rendezése (legfrissebb elől)
+            const sortedKeys = Object.keys(data).sort((a, b) => {
+                return (data[b].timestamp || 0) - (data[a].timestamp || 0);
+            });
+
+            sortedKeys.forEach(key => {
+                const deal = data[key];
+
+                // SZŰRÉS: Ha nem admin, csak a 'sent' vagy 'completed' állapotút látja
+                if (!isAdmin && deal.status === 'pending') return;
+
+                const tr = document.createElement('tr');
+                const time = deal.timestamp ? new Date(deal.timestamp * 1000).toLocaleTimeString('hu-HU', {hour: '2-digit', minute:'2-digit'}) : '--:--';
+
+                tr.innerHTML = `
+                    <td style="color: #64748b; font-size: 13px;">${time}</td>
+                    <td><a href="${deal.link}" target="_blank">${deal.title}</a></td>
+                    <td><span class="badge status-${deal.status}">${deal.status}</span></td>
+                    <td class="admin-only ${isAdmin ? '' : 'hidden'}">
+                        <button class="btn btn-approve" onclick="approveDeal('${key}')">KÜLDÉS</button>
+                        <button class="btn btn-delete" onclick="deleteDeal('${key}')">TÖRLÉS</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+            
+            if (tbody.innerHTML === '') {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 20px;">Nincs jóváhagyott publikus ajánlat.</td></tr>';
+            }
+        });
+    }
+
+    // 5. Műveletek (Admin funkciók)
+    function approveDeal(id) {
+        if (!isAdmin) return;
+        database.ref('deals/' + id).update({
+            status: 'sent'
+        }).catch(err => alert("Hiba az élesítésnél: " + err.message));
+    }
+
+    function deleteDeal(id) {
+        if (!isAdmin) return;
+        if (confirm("Biztosan törlöd ezt az ajánlatot?")) {
+            database.ref('deals/' + id).remove()
+            .catch(err => alert("Hiba a törlésnél: " + err.message));
+        }
+    }
+
+    function triggerReset() {
+        if (!isAdmin) return;
+        if (confirm("FIGYELEM: Ez minden jelenlegi ajánlatot töröl és új keresést indít. Biztosan mehet?")) {
+            // 1. Deals ág ürítése
+            database.ref('deals').remove()
+            .then(() => {
+                // 2. Parancs küldése a botnak
+                return database.ref('commands/full_scan').set({
+                    processed: false,
+                    timestamp: Date.now() / 1000
+                });
+            })
+            .then(() => {
+                alert("Adatbázis ürítve, a parancs elküldve a botnak!");
+            })
+            .catch(err => alert("Hiba a reset során: " + err.message));
+        }
+    }
+
+    // Kezdő futtatás (Public mód)
+    fetchDeals();
+
+</script>
+</body>
+</html>
