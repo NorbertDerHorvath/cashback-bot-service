@@ -1,6 +1,4 @@
+pyTelegramBotAPI
 firebase-admin
-requests
-beautifulsoup4
-lxml
 flask
 gunicorn
