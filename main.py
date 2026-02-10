@@ -14,75 +14,77 @@ CHAT_ID = "8494341633"
 JSON_FILE = "coupons-79d9f-firebase-adminsdk-fbsvc-6cfc7ef3a2.json"
 RENDER_URL = "https://cashback-bot-service.onrender.com"
 
-# Firebase inicializálás
-if not firebase_admin._apps:
-    try:
-        if os.path.exists(JSON_FILE):
-            cred = credentials.Certificate(JSON_FILE)
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
-            })
-            print("✅ Firebase kapcsolat aktív.")
-        else:
-            print(f"❌ HIBA: {JSON_FILE} hiányzik!")
-    except Exception as e:
-        print(f"❌ Firebase hiba: {e}")
-
-bot = telebot.TeleBot(TOKEN)
+# Flask inicializálása elölre, hogy azonnal válaszolni tudjon
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # Minden egyes látogatáskor (amit pl. a Cron-job generál) frissítjük a Firebase-t is
     if firebase_admin._apps:
-        db.reference('system/last_wakeup').set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    return "Bot status: Active. Pulse sent to Firebase.", 200
-
-# --- KÉTIRÁNYÚ ÉBRENTARTÓ ---
-def keep_alive_loop():
-    """Körforgás: Render pingeli saját magát ÉS frissíti a Firebase-t"""
-    while True:
         try:
-            # 1. Saját magunk hívása (Render ébrentartás)
-            requests.get(RENDER_URL)
-            
-            # 2. Firebase frissítése (Adatbázis kapcsolat ébrentartás)
-            if firebase_admin._apps:
-                db.reference('system/keep_alive_ping').set(time.time())
-                
-            print(f"💓 Életjel elküldve: {datetime.now().strftime('%H:%M:%S')}")
-        except Exception as e:
-            print(f"⚠️ Ébrentartási hiba: {e}")
-        
-        time.sleep(600) # 10 percenként fut le (a 15 perces leállás előtt)
+            db.reference('system/last_wakeup').set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except:
+            pass
+    return "Bot status: Active", 200
 
-# --- ADMIN FIGYELŐ ---
-def watch_admin():
-    print("🚀 Admin parancsfigyelő aktív...")
-    while True:
+# --- BOT ÉS FIREBASE FOLYAMATOK ---
+def start_bot_logic():
+    # Csak a szálon belül inicializáljuk a Firebase-t
+    if not firebase_admin._apps:
         try:
-            if firebase_admin._apps:
-                ref = db.reference('commands/full_scan')
-                cmd = ref.get()
-                
-                if cmd and cmd.get('processed') == False:
-                    db.reference('coupons').delete()
-                    bot.send_message(CHAT_ID, "🔄 Admin parancs: Adatbázis ürítve!")
-                    ref.update({'processed': True})
+            if os.path.exists(JSON_FILE):
+                cred = credentials.Certificate(JSON_FILE)
+                firebase_admin.initialize_app(cred, {
+                    'databaseURL': "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
+                })
+                print("✅ Firebase kapcsolat aktív.")
+            else:
+                print(f"❌ HIBA: {JSON_FILE} hiányzik!")
         except Exception as e:
-            print(f"⚠️ Hiba: {e}")
-        time.sleep(5)
+            print(f"❌ Firebase hiba: {e}")
 
-def run_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    bot = telebot.TeleBot(TOKEN)
 
-if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=keep_alive_loop, daemon=True).start()
+    # Belső funkció az admin figyeléshez
+    def watch_admin():
+        while True:
+            try:
+                if firebase_admin._apps:
+                    ref = db.reference('commands/full_scan')
+                    cmd = ref.get()
+                    if cmd and cmd.get('processed') == False:
+                        db.reference('coupons').delete()
+                        bot.send_message(CHAT_ID, "🔄 Admin parancs: Adatbázis ürítve!")
+                        ref.update({'processed': True})
+            except Exception as e:
+                print(f"⚠️ Hiba: {e}")
+            time.sleep(10)
+
+    # Belső funkció az önhívóhoz
+    def keep_alive():
+        while True:
+            try:
+                requests.get(RENDER_URL)
+                if firebase_admin._apps:
+                    db.reference('system/keep_alive_ping').set(time.time())
+            except:
+                pass
+            time.sleep(600)
+
+    # Szálak indítása a bot logikán belül
     threading.Thread(target=watch_admin, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
 
+    print("🤖 Bot polling indítása...")
     try:
         bot.polling(none_stop=True)
     except Exception as e:
         print(f"❌ Telegram hiba: {e}")
+
+# --- INDÍTÁS ---
+if __name__ == "__main__":
+    # 1. A bot logikát egy külön szálon indítjuk el, hogy ne blokkolja a Flask-et
+    threading.Thread(target=start_bot_logic, daemon=True).start()
+    
+    # 2. A Flask szerver indítása a főszálon
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
