@@ -6,6 +6,7 @@ from flask import Flask
 import telebot
 import firebase_admin
 from firebase_admin import credentials, db
+from datetime import datetime
 
 # --- KONFIGURÁCIÓ ---
 TOKEN = "8210425098:AAEAkmwRXrIrk9vt2rytnvWhcqSVfxQYa6g"
@@ -21,7 +22,7 @@ if not firebase_admin._apps:
             firebase_admin.initialize_app(cred, {
                 'databaseURL': "https://coupons-79d9f-default-rtdb.europe-west1.firebasedatabase.app/"
             })
-            print("✅ Firebase kapcsolat felépítve.")
+            print("✅ Firebase kapcsolat aktív.")
         else:
             print(f"❌ HIBA: {JSON_FILE} hiányzik!")
     except Exception as e:
@@ -32,20 +33,30 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot status: Online and watching Firebase", 200
+    # Minden egyes látogatáskor (amit pl. a Cron-job generál) frissítjük a Firebase-t is
+    if firebase_admin._apps:
+        db.reference('system/last_wakeup').set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return "Bot status: Active. Pulse sent to Firebase.", 200
 
-# --- ÉBRENTARTÓ FUNKCIÓ ---
-def keep_alive_ping():
-    """A bot 5 percenként meghívja saját magát, hogy a Render ne altassa el"""
+# --- KÉTIRÁNYÚ ÉBRENTARTÓ ---
+def keep_alive_loop():
+    """Körforgás: Render pingeli saját magát ÉS frissíti a Firebase-t"""
     while True:
         try:
+            # 1. Saját magunk hívása (Render ébrentartás)
             requests.get(RENDER_URL)
-            print("Self-ping sikeres.")
+            
+            # 2. Firebase frissítése (Adatbázis kapcsolat ébrentartás)
+            if firebase_admin._apps:
+                db.reference('system/keep_alive_ping').set(time.time())
+                
+            print(f"💓 Életjel elküldve: {datetime.now().strftime('%H:%M:%S')}")
         except Exception as e:
-            print(f"Self-ping hiba: {e}")
-        time.sleep(300) # 5 perc
+            print(f"⚠️ Ébrentartási hiba: {e}")
+        
+        time.sleep(600) # 10 percenként fut le (a 15 perces leállás előtt)
 
-# --- ADMIN FIGYELŐ ÉS TÖRLŐ ---
+# --- ADMIN FIGYELŐ ---
 def watch_admin():
     print("🚀 Admin parancsfigyelő aktív...")
     while True:
@@ -55,19 +66,11 @@ def watch_admin():
                 cmd = ref.get()
                 
                 if cmd and cmd.get('processed') == False:
-                    print("🔔 RESET PARANCS ÉRZÉKELVE!")
-                    
-                    # 1. Adatbázis ürítése Pythonból
                     db.reference('coupons').delete()
-                    
-                    # 2. Telegram értesítés
-                    bot.send_message(CHAT_ID, "🔄 Admin parancs: Adatbázis kiürítve, új keresés indul!")
-                    
-                    # 3. Parancs nyugtázása a Firebase-ben
+                    bot.send_message(CHAT_ID, "🔄 Admin parancs: Adatbázis ürítve!")
                     ref.update({'processed': True})
         except Exception as e:
-            print(f"⚠️ Firebase figyelő hiba: {e}")
-        
+            print(f"⚠️ Hiba: {e}")
         time.sleep(5)
 
 def run_server():
@@ -76,10 +79,9 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=keep_alive_ping, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
     threading.Thread(target=watch_admin, daemon=True).start()
 
-    print("🤖 Bot polling indítása...")
     try:
         bot.polling(none_stop=True)
     except Exception as e:
